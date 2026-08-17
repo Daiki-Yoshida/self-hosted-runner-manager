@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bash:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: bash -n bin/runner-manager lib/common.sh install.sh uninstall.sh tests/run.sh
+      - name: Unit tests
+        run: tests/run.sh
