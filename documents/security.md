@@ -2,43 +2,97 @@
 
 ## Trust boundary
 
-A self-hosted runner executes workflow code on the host. A repository that can dispatch code to a runner must therefore be treated as trusted for that host's runner privileges.
+A self-hosted runner executes workflow code on the host. A repository that can dispatch code to a runner must be trusted for that host's runner privileges.
 
-This project is designed for trusted private repositories owned by the operator. Public or untrusted-contributor repositories should not be attached to these persistent hosts without a separate threat model.
+This project is intended for trusted private repositories owned by the operator. Public repositories or untrusted contributor workflows need a separate threat model.
+
+## No long-lived GitHub credential on runner hosts
+
+The core v0.2 rule is:
+
+> Runner hosts do not need `gh auth`, PATs, OAuth tokens, or GitHub App credentials.
+
+Repository authentication stays in the human's browser session.
+
+For registration, the operator copies GitHub's short-lived command:
+
+```text
+./config.sh --url https://github.com/OWNER/REPO --token ********
+```
+
+into a hidden `runner-manager add` prompt.
+
+For removal, the same model is used with GitHub's short-lived removal command/token.
+
+## Token handling
+
+The manager:
+
+- does not evaluate pasted Configure/Remove text as shell code;
+- extracts only validated URL/token fields;
+- disables terminal echo while the line is pasted;
+- never writes registration/removal tokens to manager config/state;
+- never intentionally prints tokens;
+- clears shell variables after use.
+
+The upstream `config.sh` interface requires the token as a command-line argument. Therefore a sufficiently privileged local process can briefly observe that short-lived token in process arguments. This is an upstream interface limitation.
 
 ## Privilege separation
 
-The administrator runs `runner-manager` as a normal sudo-capable account. The manager creates and uses a dedicated account:
+The administrator runs `runner-manager` as a normal sudo-capable account. Runner processes run as:
 
 ```text
 gha-runner
 ```
 
-The account is not granted sudo by this project. It is also not added to the Docker group by this project. Granting Docker socket access would be a separate security decision because it is effectively host-privileged in common Docker configurations.
+This project does not grant `gha-runner`:
 
-## GitHub authentication
+- sudo;
+- Docker group membership;
+- admin-user SSH credentials;
+- GitHub API credentials.
 
-The manager relies on `gh auth` owned by the administrator. GitHub's repository runner endpoints require repository administration permissions. For classic OAuth/PAT access to private repositories, GitHub documents the `repo` scope; fine-grained tokens require repository Administration permissions (read for download metadata and write for registration/removal tokens).
+Docker socket access is intentionally separate because normal Docker daemon access is commonly equivalent to host-level privilege.
 
-The long-running runner account does not receive the administrator's `gh` credentials.
+## Runner package source and integrity
 
-## Registration and removal tokens
+Package metadata is obtained from GitHub's public `actions/runner` release API over HTTPS without authentication.
 
-GitHub's registration and removal tokens expire after one hour. The manager:
+The manager selects the expected Linux/architecture asset and requires GitHub release asset metadata to include:
 
-- requests them only when needed;
-- stores them only in shell variables;
-- does not write them into manager state;
-- does not intentionally print them;
-- clears the shell variable immediately after the configuration/removal call.
+```text
+sha256:<digest>
+```
 
-The official `config.sh` requires the token as an argument, so the short-lived token may be briefly observable to a sufficiently privileged local process through process inspection. This is a limitation of the upstream interface, not a persistent secret created by the manager.
+The downloaded archive is checked with `sha256sum` before extraction or caching. Cached archives are revalidated before reuse.
 
-## Runner package integrity
+The manager fails closed if the selected release asset does not contain a SHA-256 digest.
 
-The manager obtains the download URL from GitHub's authenticated runner-download API and downloads it over HTTPS from GitHub. The REST response currently provides filename and download URL but no checksum field. The GitHub web setup flow may display a checksum, but v1 does not scrape UI content to reproduce that check.
+## Progressive runner releases
 
-This tradeoff is explicit. A future version may add an independent release-integrity mechanism if GitHub exposes a stable machine-readable checksum source.
+GitHub Actions Runner uses progressive rollout. The newest public `actions/runner` release may briefly differ from the version shown by one repository's authenticated setup page.
+
+Because the host intentionally cannot query that private page, v0.2 uses:
+
+```bash
+runner-manager add
+```
+
+for public latest and supports:
+
+```bash
+runner-manager add --version X.Y.Z
+```
+
+when the repository page displays a different version. URL and digest are still independently resolved from official public release metadata.
+
+This limitation is preferable to introducing persistent GitHub credentials onto the runner host.
+
+## Public manager repository
+
+For credential-free installation, this manager repository should be public. No secrets, tokens, host addresses, or private repository data should ever be committed here.
+
+A public source repository also makes the code executed with sudo reviewable before installation. Operators should prefer a pinned tag/commit for mature deployments rather than blindly piping a mutable branch directly into a privileged shell.
 
 ## Network policy
 
@@ -54,4 +108,8 @@ GitHub Actions runner communication is outbound. Network hardening remains a hos
 
 ## systemd and needrestart
 
-The manager uses GitHub's generated `svc.sh` for systemd integration. During `init`, Debian/Ubuntu hosts with `needrestart` receive GitHub's documented override preventing an Actions runner service from being restarted in the middle of a workflow job.
+The manager uses GitHub's generated `svc.sh` for systemd integration. During `init`, Debian/Ubuntu hosts with `needrestart` receive GitHub's documented override preventing Actions runner services from being restarted in the middle of workflow jobs.
+
+## Local state exposure
+
+Manager config and per-repository state contain repository names, runner names, versions, paths, labels, and timestamps only. They are root-owned and do not contain GitHub registration/removal tokens.

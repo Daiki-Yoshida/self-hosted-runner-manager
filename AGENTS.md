@@ -2,28 +2,33 @@
 
 ## Purpose
 
-This repository manages repository-scoped GitHub Actions self-hosted runners on trusted Linux hosts through GitHub CLI (`gh`) and the official GitHub Actions runner package.
+This repository manages repository-scoped GitHub Actions self-hosted runners on trusted Linux hosts while avoiding long-lived GitHub credentials on those hosts.
 
 ## Safety invariants
 
-- Never persist GitHub runner registration or removal tokens.
-- Never print runner registration or removal tokens.
+- Never require `gh auth`, PATs, OAuth tokens, or GitHub App credentials on runner hosts.
+- Registration/removal authentication is supplied only through short-lived GitHub-generated commands/tokens pasted interactively by the operator.
+- Never persist or print runner registration/removal tokens.
+- Never `eval` pasted Configure/Remove commands. Parse only expected URL/token fields and validate them.
 - The runner process must not run as root.
-- Use a dedicated `gha-runner` Unix account for runner services.
-- Do not add the runner account to `sudo`, `docker`, or other privilege-bearing groups unless a separate reviewed change explicitly requires it.
+- Use dedicated `gha-runner` Unix account for runner services.
+- Do not add `gha-runner` to `sudo`, `docker`, or other privilege-bearing groups unless a separate reviewed change explicitly requires it.
 - Do not modify SSH, UFW, cloud-provider firewalls, Tailscale, or unrelated host configuration.
-- Repository input must be validated and shell-quoted.
-- `gh api` is the source for repository-scoped runner download metadata and short-lived registration/removal tokens.
+- Runner packages must come from official public `actions/runner` release assets and must pass SHA-256 digest validation before extraction.
 - Keep systemd service installation aligned with GitHub's generated `svc.sh` rather than hand-authoring runner units.
-- Preserve rollback: failed registration must not leave a registered but unmanaged runner when cleanup is possible.
+- After successful `config.sh`, do not delete local runner state on later failures; preserve recovery ability for the already-registered remote runner.
+
+## Version selection
+
+GitHub progressively rolls out runner versions. Default behavior may resolve the public latest stable release, but the CLI must retain an explicit `--version X.Y.Z` override so operators can match the version shown by a repository's authenticated setup page without introducing GitHub API credentials on the host.
 
 ## Scope
 
 - Linux only.
-- systemd is required in v1, including WSL environments.
-- Repository-scoped runners only in v1.
+- systemd required in v0.2, including WSL environments.
+- Repository-scoped runners only.
 - One runner service per repository per host.
-- Host-wide cross-repository concurrency limiting is intentionally not implemented in v1; see `documents/architecture.md`.
+- Host-wide cross-repository concurrency limiting is intentionally not implemented yet; see `documents/architecture.md`.
 
 ## Verification
 
@@ -33,3 +38,5 @@ Before committing changes:
 bash -n bin/runner-manager lib/common.sh install.sh uninstall.sh tests/run.sh
 tests/run.sh
 ```
+
+Tests must not require GitHub authentication or live private-repository access.

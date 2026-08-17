@@ -14,6 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax check
-        run: bash -n bin/runner-manager lib/common.sh install.sh uninstall.sh tests/run.sh
+        run: bash -n bin/runner-manager lib/common.sh bootstrap.sh install.sh uninstall.sh tests/run.sh
       - name: Unit tests
         run: tests/run.sh

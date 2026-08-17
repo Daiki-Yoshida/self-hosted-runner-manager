@@ -23,6 +23,32 @@ assert_eq 'x64' "$(SHRM_TEST_UNAME_M=x86_64; uname() { if [[ "$1" == '-m' ]]; th
 assert_eq 'personal-ci,xserver,always-on' "$(csv_normalize 'personal-ci, xserver,always-on,personal-ci')" 'label normalization'
 assert_eq 'xserver-testgithubactions' "$(make_runner_name xserver 'Daiki-Yoshida/TestGitHubActions')" 'runner name'
 
+parse_configure_command './config.sh --url https://github.com/Daiki-Yoshida/TestGitHubActions --token AbC_123-xyz'
+assert_eq 'Daiki-Yoshida/TestGitHubActions' "$PARSED_REPO" 'parse Configure repo'
+assert_eq 'AbC_123-xyz' "$PARSED_TOKEN" 'parse Configure token'
+
+parse_configure_command './config.sh --url https\://github.com/Daiki-Yoshida/TestGitHubActions --token AbC123'
+assert_eq 'Daiki-Yoshida/TestGitHubActions' "$PARSED_REPO" 'parse escaped Configure repo'
+assert_eq 'AbC123' "$PARSED_TOKEN" 'parse escaped Configure token'
+
+parse_remove_command './config.sh remove --token Remove_123-xyz'
+assert_eq 'Remove_123-xyz' "$PARSED_REMOVE_TOKEN" 'parse Remove command'
+parse_remove_command 'OnlyToken_123'
+assert_eq 'OnlyToken_123' "$PARSED_REMOVE_TOKEN" 'parse Remove token only'
+
+if ! validate_version '2.336.0'; then
+  printf 'FAIL valid version accepted\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'PASS valid version accepted\n'
+fi
+if validate_version 'v2.336.0' || validate_version 'latest'; then
+  printf 'FAIL invalid version rejected\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'PASS invalid version rejected\n'
+fi
+
 long_repo='Daiki-Yoshida/this-is-an-extremely-long-repository-name-that-needs-a-shortened-runner-name-for-safety'
 long_name="$(make_runner_name desktop-wsl "$long_repo")"
 if ((${#long_name} > 60)); then
@@ -37,6 +63,13 @@ if normalize_repo 'not a repo' >/dev/null 2>&1; then
   failures=$((failures + 1))
 else
   printf 'PASS invalid repository rejected\n'
+fi
+
+if parse_configure_command 'rm -rf / --token anything' >/dev/null 2>&1; then
+  printf 'FAIL arbitrary pasted command rejected\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'PASS arbitrary pasted command rejected\n'
 fi
 
 if ((failures)); then

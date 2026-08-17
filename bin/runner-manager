@@ -17,7 +17,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   runner-manager init [--profile xserver|desktop-wsl|custom] [--prefix NAME] [--labels CSV]
-  runner-manager add OWNER/REPO
+  runner-manager add [--version X.Y.Z]
   runner-manager list
   runner-manager status [OWNER/REPO]
   runner-manager remove OWNER/REPO [--yes]
@@ -25,7 +25,8 @@ Usage:
   runner-manager version
   runner-manager help
 
-Repository arguments also accept https://github.com/OWNER/REPO URLs.
+`add` never needs GitHub CLI credentials on the host. It securely prompts for the
+repository-specific `./config.sh --url ... --token ...` line shown by GitHub.
 USAGE
 }
 
@@ -34,10 +35,10 @@ cmd_init() {
   require_not_root
   require_systemd
   require_command sudo
-  require_command gh
   require_command curl
   require_command tar
   require_command sha256sum
+  require_command python3
 
   local profile="" prefix="" labels="" selector="" arch
   while (($#)); do
@@ -111,20 +112,21 @@ cmd_init() {
   sudo install -o root -g root -m 0644 "$tmp" "$SHRM_CONFIG_FILE"
   rm -f "$tmp"
 
+  # GitHub documents this override for Debian/Ubuntu hosts using needrestart.
   if [[ -d /etc/needrestart/conf.d || -x /usr/sbin/needrestart ]]; then
     sudo install -d -m 0755 /etc/needrestart/conf.d
     printf '%s\n' '$nrconf{override_rc}{qr(^actions\.runner\..+\.service$)} = 0;' | \
       sudo tee /etc/needrestart/conf.d/actions_runner_services.conf >/dev/null
   fi
 
-  log "Initialized. Next: gh auth status && runner-manager doctor"
+  log "Initialized. Next: runner-manager doctor"
 }
 
 cmd_doctor() {
   require_linux
   require_not_root
   local failed=0 cmd arch
-  for cmd in gh curl tar sudo systemctl sha256sum; do
+  for cmd in curl tar sudo systemctl sha256sum python3; do
     if command -v "$cmd" >/dev/null 2>&1; then
       printf 'OK   %-14s %s\n' "$cmd" "$(command -v "$cmd")"
     else
@@ -144,30 +146,58 @@ cmd_doctor() {
     printf 'FAIL %-14s not active\n' systemd
     failed=1
   fi
-  if gh auth status --hostname github.com >/dev/null 2>&1; then
-    printf 'OK   %-14s authenticated\n' gh-auth
-  else
-    printf 'FAIL %-14s run: gh auth login\n' gh-auth
-    failed=1
-  fi
   if [[ -r "$SHRM_CONFIG_FILE" ]]; then
     load_config
     printf 'OK   %-14s profile=%s user=%s root=%s\n' config "$PROFILE" "$RUNNER_USER" "$RUNNER_ROOT"
   else
     printf 'WARN %-14s run: runner-manager init --profile xserver\n' config
   fi
+  if curl --fail --silent --show-error --location --max-time 10 \
+      -H 'Accept: application/vnd.github+json' \
+      -H "X-GitHub-Api-Version: ${SHRM_GITHUB_API_VERSION}" \
+      "${SHRM_RUNNER_RELEASE_API}/latest" >/dev/null; then
+    printf 'OK   %-14s public GitHub release API reachable\n' github-public
+  else
+    printf 'FAIL %-14s cannot reach actions/runner release API\n' github-public
+    failed=1
+  fi
   return "$failed"
+}
+
+read_configure_command() {
+  local line
+  printf '\nOpen the repository runner setup page in your browser:\n'
+  printf '  Settings -> Actions -> Runners -> New self-hosted runner -> Linux / %s\n\n' "$RUNNER_ARCH"
+  printf 'Paste ONLY the Configure line shown by GitHub. Input is hidden so the token is not echoed.\n'
+  printf 'Example: ./config.sh --url https://github.com/OWNER/REPO --token ********\n'
+  IFS= read -r -s -p '> ' line
+  printf '\n'
+  parse_configure_command "$line" || die "Could not parse the Configure command."
+  line=""
 }
 
 cmd_add() {
   require_linux; require_not_root; require_systemd
-  require_command gh; require_command curl; require_command tar; require_command sudo
-  require_gh_auth; load_config
-  (($# == 1)) || die "Usage: runner-manager add OWNER/REPO"
+  require_command curl; require_command tar; require_command sudo; require_command sha256sum; require_command python3
+  load_config
 
-  local repo owner name key dir runner_name labels metadata filename download_url token remote_id tmp archive cached_archive configured=0
-  repo="$(normalize_repo "$1")" || die "Invalid repository: $1"
-  owner="$(repo_owner "$repo")"; name="$(repo_name "$repo")"
+  local requested_version=""
+  while (($#)); do
+    case "$1" in
+      --version) requested_version="${2:-}"; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown add option: $1" ;;
+    esac
+  done
+  if [[ -n "$requested_version" ]]; then
+    validate_version "$requested_version" || die "Invalid version: $requested_version"
+  fi
+
+  read_configure_command
+  local repo="$PARSED_REPO" token="$PARSED_TOKEN"
+  PARSED_TOKEN=""
+
+  local key dir runner_name labels release version filename download_url sha256 metadata archive cached_archive tmp configured=0
   key="$(repo_key "$repo")"
   dir="${RUNNER_ROOT}/${key}"
   runner_name="$(make_runner_name "$RUNNER_NAME_PREFIX" "$repo")"
@@ -175,49 +205,47 @@ cmd_add() {
 
   [[ ! -e "$(state_file_for_repo "$repo")" ]] || die "$repo is already managed on this host."
   [[ ! -e "$dir" ]] || die "Runner directory already exists: $dir"
-  repo_has_admin_access "$repo" || die "GitHub account lacks repository admin access (or API scope) for $repo. For classic gh OAuth on a private repo, ensure the 'repo' scope is available."
 
-  remote_id="$(find_remote_runner_id "$repo" "$runner_name")"
-  [[ -z "$remote_id" ]] || die "GitHub already has runner '$runner_name' for $repo (id=$remote_id). Remove/reconcile it first."
+  log "Resolving public actions/runner release metadata for linux/${RUNNER_ARCH}"
+  metadata="$(resolve_runner_asset "$RUNNER_ARCH" "$requested_version")"
+  IFS=$'\t' read -r version filename download_url sha256 <<< "$metadata"
+  [[ -n "$version" && -n "$filename" && -n "$download_url" && -n "$sha256" ]] || die "Incomplete runner release metadata."
 
-  log "Resolving GitHub runner application for linux/${RUNNER_ARCH}"
-  metadata="$(gh_api "repos/${repo}/actions/runners/downloads" \
-    --jq ".[] | select(.os == \"linux\" and .architecture == \"${RUNNER_ARCH}\") | [.filename, .download_url] | @tsv" | head -n1)"
-  [[ -n "$metadata" ]] || die "GitHub did not return a linux/${RUNNER_ARCH} runner application."
-  IFS=$'\t' read -r filename download_url <<< "$metadata"
+  if [[ -z "$requested_version" ]]; then
+    log "Public latest runner release is v${version}."
+    warn "GitHub rolls runner versions out progressively. If this repository's Download section shows a different version, cancel now and rerun: runner-manager add --version X.Y.Z"
+  else
+    log "Using explicitly selected runner release v${version}."
+  fi
 
   tmp="$(mktemp -d)"
   archive="${tmp}/${filename}"
   cached_archive="${RUNNER_CACHE}/${filename}"
-  cleanup_add() {
+  cleanup_before_registration() {
     local rc=$?
     trap - EXIT
-    if ((rc != 0)); then
-      warn "Add failed; cleaning local partial state."
-      if ((configured == 1)); then
-        if [[ -x "$dir/svc.sh" ]]; then
-          (cd "$dir" && sudo ./svc.sh stop) >/dev/null 2>&1 || true
-          (cd "$dir" && sudo ./svc.sh uninstall) >/dev/null 2>&1 || true
-        fi
-        local cleanup_token=""
-        cleanup_token="$(gh_api --method POST "repos/${repo}/actions/runners/remove-token" --jq '.token' 2>/dev/null || true)"
-        if [[ -n "$cleanup_token" && -x "$dir/config.sh" ]]; then
-          run_as_runner "$RUNNER_USER" "$dir" ./config.sh remove --token "$cleanup_token" >/dev/null 2>&1 || true
-        fi
-      fi
+    token=""
+    PARSED_TOKEN=""
+    if ((rc != 0)) && ((configured == 0)); then
       sudo rm -rf "$dir" >/dev/null 2>&1 || true
-      remove_state "$repo" >/dev/null 2>&1 || true
     fi
     rm -rf "$tmp" >/dev/null 2>&1 || true
     exit "$rc"
   }
-  trap cleanup_add EXIT
+  trap cleanup_before_registration EXIT
 
   if [[ -s "$cached_archive" ]]; then
-    log "Using cached runner package: $filename"
-  else
-    log "Downloading $filename"
+    log "Verifying cached runner package: $filename"
+    printf '%s  %s\n' "$sha256" "$cached_archive" | sha256sum -c - >/dev/null || {
+      warn "Cached package failed checksum; downloading a clean copy."
+      sudo rm -f "$cached_archive"
+    }
+  fi
+
+  if [[ ! -s "$cached_archive" ]]; then
+    log "Downloading official GitHub runner package v${version}"
     curl --fail --location --proto '=https' --tlsv1.2 --output "$archive" "$download_url"
+    printf '%s  %s\n' "$sha256" "$archive" | sha256sum -c -
     sudo install -o root -g root -m 0644 "$archive" "$cached_archive"
   fi
 
@@ -225,36 +253,46 @@ cmd_add() {
   sudo tar -xzf "$cached_archive" -C "$dir"
   sudo chown -R "$RUNNER_USER:$RUNNER_USER" "$dir"
 
-  log "Requesting one-hour repository registration token through gh api"
-  token="$(gh_api --method POST "repos/${repo}/actions/runners/registration-token" --jq '.token')"
-  [[ -n "$token" ]] || die "GitHub returned an empty registration token."
-
-  log "Registering '$runner_name' for $repo"
-  run_as_runner "$RUNNER_USER" "$dir" \
-    ./config.sh \
-      --url "https://github.com/${repo}" \
-      --token "$token" \
-      --name "$runner_name" \
-      --labels "$labels" \
-      --work _work \
-      --unattended
+  log "Registering '$runner_name' for $repo as $RUNNER_USER"
+  if ! run_as_runner "$RUNNER_USER" "$dir" \
+      ./config.sh \
+        --url "https://github.com/${repo}" \
+        --token "$token" \
+        --name "$runner_name" \
+        --labels "$labels" \
+        --work _work \
+        --unattended; then
+    token=""
+    die "GitHub runner configuration failed. No persistent manager secret was written."
+  fi
   token=""
   configured=1
+  [[ -s "$dir/.runner" ]] || die "config.sh returned successfully but .runner was not created; preserving directory for diagnosis: $dir"
 
-  log "Installing systemd service as $RUNNER_USER"
-  (cd "$dir" && sudo ./svc.sh install "$RUNNER_USER")
-  (cd "$dir" && sudo ./svc.sh start)
-
-  write_state "$repo" "$runner_name" "$dir" "$labels"
-  remote_id="$(wait_for_remote_runner "$repo" "$runner_name" 15 || true)"
-  [[ -n "$remote_id" ]] || die "Runner service started, but GitHub API did not report runner '$runner_name' within 30 seconds."
-
-  configured=0
+  # From this point onward the runner is registered remotely. Preserve local state on later failure;
+  # silently deleting the local installation would strand an unmanaged remote runner.
+  write_state "$repo" "$runner_name" "$dir" "$labels" "$version" "registered"
   trap - EXIT
   rm -rf "$tmp"
 
+  log "Installing official systemd integration as $RUNNER_USER"
+  if ! (cd "$dir" && sudo ./svc.sh install "$RUNNER_USER"); then
+    die "Runner is registered but service installation failed. Local state is preserved; inspect: $dir"
+  fi
+  if ! (cd "$dir" && sudo ./svc.sh start); then
+    die "Runner is registered and service installed, but service start failed. Local state is preserved."
+  fi
+
+  local service
+  service="$(service_name_from_dir "$dir")"
+  if [[ -z "$service" ]] || ! systemctl is-active --quiet "$service"; then
+    die "Runner registration succeeded, but systemd did not report the runner service active."
+  fi
+  write_state "$repo" "$runner_name" "$dir" "$labels" "$version" "managed"
+
   log "Registered successfully: $repo"
-  printf '\nRunner name: %s\nLabels: self-hosted, Linux, %s, %s\n' "$runner_name" "$RUNNER_ARCH" "$labels"
+  printf '\nRunner name: %s\nRunner version: %s\nLabels: self-hosted, Linux, %s, %s\n' "$runner_name" "$version" "$RUNNER_ARCH" "$labels"
+  printf 'GitHub settings: https://github.com/%s/settings/actions/runners\n' "$repo"
   printf '\nSuggested dedicated selector:\n  runs-on: [self-hosted, %s]\n' "$SELECTOR_LABEL"
   if [[ ",${labels}," == *,personal-ci,* ]]; then
     printf 'Shared pool selector:\n  runs-on: [self-hosted, personal-ci]\n'
@@ -268,34 +306,28 @@ cmd_list() {
   shopt -s nullglob
   for state in "$SHRM_STATE_DIR"/*.conf; do
     found=1
+    # shellcheck disable=SC1090
     source "$state"
-    printf '%-45s %-32s %s\n' "$REPO" "$RUNNER_NAME" "$RUNNER_DIR"
+    printf '%-45s %-32s v%-10s %s\n' "$REPO" "$RUNNER_NAME" "${RUNNER_VERSION:-?}" "$RUNNER_DIR"
   done
   ((found == 1)) || printf '(no managed runners)\n'
 }
 
 status_one() {
-  local repo="$1" service api
+  local repo="$1" service local_status
   load_state "$repo" || { printf '%-40s LOCAL=unmanaged\n' "$repo"; return 1; }
   service="$(service_name_from_dir "$RUNNER_DIR")"
-  local local_status="unknown"
+  local_status="unknown"
   if [[ -n "$service" ]]; then
     local_status="$(systemctl is-active "$service" 2>/dev/null || true)"
   fi
-  api="$(gh_api "repos/${repo}/actions/runners?per_page=100" \
-    --jq ".runners[]? | select(.name == \"${RUNNER_NAME}\") | [.status, (.busy|tostring), .version] | @tsv" 2>/dev/null | head -n1 || true)"
-  if [[ -n "$api" ]]; then
-    local remote_status busy version
-    IFS=$'\t' read -r remote_status busy version <<< "$api"
-    printf '%-40s service=%-8s github=%-7s busy=%-5s version=%s\n' "$repo" "$local_status" "$remote_status" "$busy" "$version"
-  else
-    printf '%-40s service=%-8s github=missing\n' "$repo" "$local_status"
-  fi
+  printf '%-40s service=%-8s phase=%-10s version=%s runner=%s\n' \
+    "$repo" "$local_status" "${RUNNER_PHASE:-unknown}" "${RUNNER_VERSION:-?}" "$RUNNER_NAME"
 }
 
 cmd_status() {
-  require_command gh; require_command systemctl
-  require_gh_auth; load_config
+  require_command systemctl
+  load_config
   if (($# == 1)); then
     local repo
     repo="$(normalize_repo "$1")" || die "Invalid repository: $1"
@@ -307,6 +339,7 @@ cmd_status() {
   shopt -s nullglob
   for state in "$SHRM_STATE_DIR"/*.conf; do
     found=1
+    # shellcheck disable=SC1090
     source "$state"
     status_one "$REPO" || true
   done
@@ -315,8 +348,8 @@ cmd_status() {
 
 cmd_remove() {
   require_linux; require_not_root; require_systemd
-  require_command gh; require_command sudo
-  require_gh_auth; load_config
+  require_command sudo
+  load_config
   local assume=0 repo_arg=""
   while (($#)); do
     case "$1" in
@@ -325,7 +358,8 @@ cmd_remove() {
     esac
   done
   [[ -n "$repo_arg" ]] || die "Usage: runner-manager remove OWNER/REPO [--yes]"
-  local repo token service
+
+  local repo service remove_line remove_token
   repo="$(normalize_repo "$repo_arg")" || die "Invalid repository: $repo_arg"
   load_state "$repo" || die "$repo is not managed on this host."
   if ((assume == 0)) && ! confirm "Remove runner '$RUNNER_NAME' for $repo?"; then
@@ -333,21 +367,34 @@ cmd_remove() {
     return 0
   fi
 
-  log "Requesting one-hour remove token through gh api"
-  token="$(gh_api --method POST "repos/${repo}/actions/runners/remove-token" --jq '.token')"
-  [[ -n "$token" ]] || die "GitHub returned an empty removal token."
+  printf '\nOpen this runner in GitHub and choose Remove:\n'
+  printf '  https://github.com/%s/settings/actions/runners\n' "$repo"
+  printf 'Paste the `./config.sh remove --token ...` command (or only the token). Input is hidden.\n'
+  IFS= read -r -s -p '> ' remove_line
+  printf '\n'
+  parse_remove_command "$remove_line" || die "Could not parse the removal token."
+  remove_token="$PARSED_REMOVE_TOKEN"
+  PARSED_REMOVE_TOKEN=""
+  remove_line=""
 
   service="$(service_name_from_dir "$RUNNER_DIR")"
   if [[ -x "$RUNNER_DIR/svc.sh" ]]; then
-    log "Stopping and uninstalling service${service:+ $service}"
+    log "Stopping service${service:+ $service}"
     (cd "$RUNNER_DIR" && sudo ./svc.sh stop) || true
-    (cd "$RUNNER_DIR" && sudo ./svc.sh uninstall) || true
   fi
 
-  if [[ -x "$RUNNER_DIR/config.sh" ]]; then
-    run_as_runner "$RUNNER_USER" "$RUNNER_DIR" ./config.sh remove --token "$token"
+  if ! run_as_runner "$RUNNER_USER" "$RUNNER_DIR" ./config.sh remove --token "$remove_token"; then
+    remove_token=""
+    warn "GitHub removal failed. Attempting to restart the existing runner service."
+    if [[ -x "$RUNNER_DIR/svc.sh" ]]; then (cd "$RUNNER_DIR" && sudo ./svc.sh start) || true; fi
+    die "Runner was not removed."
   fi
-  token=""
+  remove_token=""
+
+  if [[ -x "$RUNNER_DIR/svc.sh" ]]; then
+    log "Uninstalling systemd service"
+    (cd "$RUNNER_DIR" && sudo ./svc.sh uninstall) || true
+  fi
   sudo rm -rf "$RUNNER_DIR"
   remove_state "$repo"
   log "Removed: $repo"
@@ -363,4 +410,4 @@ case "${1:-help}" in
   version|--version) printf "%s %s\n" "$SHRM_NAME" "$SHRM_VERSION" ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "Unknown command: $1" ;;
-esac
+ esac
