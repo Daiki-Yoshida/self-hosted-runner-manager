@@ -111,7 +111,6 @@ cmd_init() {
   sudo install -o root -g root -m 0644 "$tmp" "$SHRM_CONFIG_FILE"
   rm -f "$tmp"
 
-  # GitHub documents this override for Debian/Ubuntu hosts using needrestart.
   if [[ -d /etc/needrestart/conf.d || -x /usr/sbin/needrestart ]]; then
     sudo install -d -m 0755 /etc/needrestart/conf.d
     printf '%s\n' '$nrconf{override_rc}{qr(^actions\.runner\..+\.service$)} = 0;' | \
@@ -207,6 +206,7 @@ cmd_add() {
         fi
       fi
       sudo rm -rf "$dir" >/dev/null 2>&1 || true
+      remove_state "$repo" >/dev/null 2>&1 || true
     fi
     rm -rf "$tmp" >/dev/null 2>&1 || true
     exit "$rc"
@@ -268,7 +268,6 @@ cmd_list() {
   shopt -s nullglob
   for state in "$SHRM_STATE_DIR"/*.conf; do
     found=1
-    # shellcheck disable=SC1090
     source "$state"
     printf '%-45s %-32s %s\n' "$REPO" "$RUNNER_NAME" "$RUNNER_DIR"
   done
@@ -276,7 +275,7 @@ cmd_list() {
 }
 
 status_one() {
-  local repo="$1" state service api
+  local repo="$1" service api
   load_state "$repo" || { printf '%-40s LOCAL=unmanaged\n' "$repo"; return 1; }
   service="$(service_name_from_dir "$RUNNER_DIR")"
   local local_status="unknown"
@@ -308,7 +307,6 @@ cmd_status() {
   shopt -s nullglob
   for state in "$SHRM_STATE_DIR"/*.conf; do
     found=1
-    # shellcheck disable=SC1090
     source "$state"
     status_one "$REPO" || true
   done
