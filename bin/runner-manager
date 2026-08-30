@@ -17,7 +17,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   runner-manager init [--profile xserver|desktop-wsl|custom] [--prefix NAME] [--labels CSV]
-  runner-manager add [--version X.Y.Z]
+  runner-manager add [OWNER/REPO] [--version X.Y.Z]
   runner-manager list
   runner-manager status [OWNER/REPO]
   runner-manager remove OWNER/REPO [--yes]
@@ -25,27 +25,25 @@ Usage:
   runner-manager version
   runner-manager help
 
-`add` never needs GitHub CLI credentials on the host. It securely prompts for the
-repository-specific `./config.sh --url ... --token ...` line shown by GitHub.
+Normal add flow:
+  1. Open GitHub's New self-hosted runner page.
+  2. Copy the Download + Configure command block (or at minimum Configure line).
+  3. Run `runner-manager add [OWNER/REPO]`, paste once, and press Ctrl-D.
+
+The pasted text is parsed as data and is NEVER eval'd or executed directly.
 USAGE
 }
 
 cmd_init() {
-  require_linux
-  require_not_root
-  require_systemd
-  require_command sudo
-  require_command curl
-  require_command tar
-  require_command sha256sum
-  require_command python3
+  require_linux; require_not_root; require_systemd
+  require_command sudo; require_command curl; require_command tar; require_command sha256sum; require_command python3
 
-  local profile="" prefix="" labels="" selector="" arch
+  local profile="" prefix="" labels="" selector="" arch choice
   while (($#)); do
     case "$1" in
-      --profile) profile="${2:-}"; shift 2 ;;
-      --prefix) prefix="${2:-}"; shift 2 ;;
-      --labels) labels="${2:-}"; shift 2 ;;
+      --profile) [[ $# -ge 2 ]] || die "--profile requires a value"; profile="$2"; shift 2 ;;
+      --prefix) [[ $# -ge 2 ]] || die "--prefix requires a value"; prefix="$2"; shift 2 ;;
+      --labels) [[ $# -ge 2 ]] || die "--labels requires a value"; labels="$2"; shift 2 ;;
       -h|--help) usage; return 0 ;;
       *) die "Unknown init option: $1" ;;
     esac
@@ -54,39 +52,24 @@ cmd_init() {
   if [[ -z "$profile" ]]; then
     printf 'Host profile:\n  1) xserver      (always-on VPS)\n  2) desktop-wsl  (desktop WSL)\n  3) custom\n'
     read -r -p '> ' choice
-    case "$choice" in
-      1) profile="xserver" ;;
-      2) profile="desktop-wsl" ;;
-      3) profile="custom" ;;
-      *) die "Invalid selection." ;;
-    esac
+    case "$choice" in 1) profile="xserver" ;; 2) profile="desktop-wsl" ;; 3) profile="custom" ;; *) die "Invalid selection." ;; esac
   fi
 
   arch="$(host_arch)" || die "Unsupported CPU architecture: $(uname -m)"
   case "$profile" in
-    xserver)
-      prefix="${prefix:-xserver}"
-      labels="${labels:-personal-ci,xserver,always-on}"
-      selector="xserver"
-      ;;
-    desktop-wsl)
-      prefix="${prefix:-desktop-wsl}"
-      labels="${labels:-personal-ci,desktop-wsl,high-memory}"
-      selector="desktop-wsl"
-      ;;
+    xserver) prefix="${prefix:-xserver}"; labels="${labels:-personal-ci,xserver,always-on}"; selector="xserver" ;;
+    desktop-wsl) prefix="${prefix:-desktop-wsl}"; labels="${labels:-personal-ci,desktop-wsl,high-memory}"; selector="desktop-wsl" ;;
     custom)
-      if [[ -z "$prefix" ]]; then read -r -p 'Runner name prefix: ' prefix; fi
-      if [[ -z "$labels" ]]; then read -r -p 'Custom labels (comma-separated): ' labels; fi
+      [[ -n "$prefix" ]] || read -r -p 'Runner name prefix: ' prefix
+      [[ -n "$labels" ]] || read -r -p 'Custom labels (comma-separated): ' labels
       selector="$(printf '%s' "$labels" | cut -d, -f1 | tr -d '[:space:]')"
       ;;
     *) die "Unknown profile: $profile" ;;
   esac
 
-  prefix="$(sanitize_component "$prefix")"
-  [[ -n "$prefix" ]] || die "Runner prefix cannot be empty."
-  labels="$(csv_normalize "$labels")"
-  [[ -n "$labels" ]] || die "At least one custom label is required."
-  selector="$(sanitize_component "$selector")"
+  prefix="$(sanitize_component "$prefix")"; [[ -n "$prefix" ]] || die "Runner prefix cannot be empty."
+  labels="$(csv_normalize "$labels")"; [[ -n "$labels" ]] || die "At least one custom label is required."
+  selector="$(sanitize_component "$selector")"; [[ -n "$selector" ]] || die "Selector label cannot be empty."
 
   log "Initializing host profile '$profile' (${arch})"
   sudo install -d -m 0755 "$SHRM_ETC_DIR" "$SHRM_STATE_DIR" "$SHRM_DEFAULT_RUNNER_ROOT" "$SHRM_DEFAULT_CACHE_DIR"
@@ -112,68 +95,56 @@ cmd_init() {
   sudo install -o root -g root -m 0644 "$tmp" "$SHRM_CONFIG_FILE"
   rm -f "$tmp"
 
-  # GitHub documents this override for Debian/Ubuntu hosts using needrestart.
   if [[ -d /etc/needrestart/conf.d || -x /usr/sbin/needrestart ]]; then
     sudo install -d -m 0755 /etc/needrestart/conf.d
-    printf '%s\n' '$nrconf{override_rc}{qr(^actions\.runner\..+\.service$)} = 0;' | \
-      sudo tee /etc/needrestart/conf.d/actions_runner_services.conf >/dev/null
+    printf '%s\n' '$nrconf{override_rc}{qr(^actions\.runner\..+\.service$)} = 0;' | sudo tee /etc/needrestart/conf.d/actions_runner_services.conf >/dev/null
   fi
-
   log "Initialized. Next: runner-manager doctor"
 }
 
 cmd_doctor() {
-  require_linux
-  require_not_root
+  require_linux; require_not_root
   local failed=0 cmd arch
   for cmd in curl tar sudo systemctl sha256sum python3; do
-    if command -v "$cmd" >/dev/null 2>&1; then
-      printf 'OK   %-14s %s\n' "$cmd" "$(command -v "$cmd")"
-    else
-      printf 'FAIL %-14s missing\n' "$cmd"
-      failed=1
-    fi
+    if command -v "$cmd" >/dev/null 2>&1; then printf 'OK   %-14s %s\n' "$cmd" "$(command -v "$cmd")"
+    else printf 'FAIL %-14s missing\n' "$cmd"; failed=1; fi
   done
-  if arch="$(host_arch 2>/dev/null)"; then
-    printf 'OK   %-14s %s\n' architecture "$arch"
-  else
-    printf 'FAIL %-14s %s\n' architecture "$(uname -m)"
-    failed=1
-  fi
-  if [[ -d /run/systemd/system ]]; then
-    printf 'OK   %-14s active\n' systemd
-  else
-    printf 'FAIL %-14s not active\n' systemd
-    failed=1
-  fi
-  if [[ -r "$SHRM_CONFIG_FILE" ]]; then
-    load_config
-    printf 'OK   %-14s profile=%s user=%s root=%s\n' config "$PROFILE" "$RUNNER_USER" "$RUNNER_ROOT"
-  else
-    printf 'WARN %-14s run: runner-manager init --profile xserver\n' config
-  fi
-  if curl --fail --silent --show-error --location --max-time 10 \
-      -H 'Accept: application/vnd.github+json' \
-      -H "X-GitHub-Api-Version: ${SHRM_GITHUB_API_VERSION}" \
-      "${SHRM_RUNNER_RELEASE_API}/latest" >/dev/null; then
+  if arch="$(host_arch 2>/dev/null)"; then printf 'OK   %-14s %s\n' architecture "$arch"
+  else printf 'FAIL %-14s %s\n' architecture "$(uname -m)"; failed=1; fi
+  if [[ -d /run/systemd/system ]]; then printf 'OK   %-14s active\n' systemd
+  else printf 'FAIL %-14s not active\n' systemd; failed=1; fi
+  if [[ -r "$SHRM_CONFIG_FILE" ]]; then load_config; printf 'OK   %-14s profile=%s user=%s root=%s\n' config "$PROFILE" "$RUNNER_USER" "$RUNNER_ROOT"
+  else printf 'WARN %-14s run: runner-manager init --profile xserver\n' config; fi
+  if curl --fail --silent --show-error --location --max-time 10 -H 'Accept: application/vnd.github+json' -H "X-GitHub-Api-Version: ${SHRM_GITHUB_API_VERSION}" "${SHRM_RUNNER_RELEASE_API}/latest" >/dev/null; then
     printf 'OK   %-14s public GitHub release API reachable\n' github-public
-  else
-    printf 'FAIL %-14s cannot reach actions/runner release API\n' github-public
-    failed=1
-  fi
+  else printf 'FAIL %-14s cannot reach actions/runner release API\n' github-public; failed=1; fi
   return "$failed"
 }
 
-read_configure_command() {
-  local line
-  printf '\nOpen the repository runner setup page in your browser:\n'
-  printf '  Settings -> Actions -> Runners -> New self-hosted runner -> Linux / %s\n\n' "$RUNNER_ARCH"
-  printf 'Paste ONLY the Configure line shown by GitHub. Input is hidden so the token is not echoed.\n'
-  printf 'Example: ./config.sh --url https://github.com/OWNER/REPO --token ********\n'
-  IFS= read -r -s -p '> ' line
+read_setup_block() {
+  local expected_repo="${1:-}" line block="" bytes=0
+  printf '\nOpen GitHub in your browser:\n'
+  if [[ -n "$expected_repo" ]]; then
+    printf '  https://github.com/%s/settings/actions/runners/new?arch=%s&os=linux\n' "$expected_repo" "$RUNNER_ARCH"
+  else
+    printf '  Repository -> Settings -> Actions -> Runners -> New self-hosted runner -> Linux / %s\n' "$RUNNER_ARCH"
+  fi
+  printf '\nCopy the GitHub Download + Configure command block and paste it below once.\n'
+  printf 'The token is not echoed. Pasted commands are parsed as DATA and are never executed directly.\n'
+  printf 'At minimum, the ./config.sh --url ... --token ... line is required.\n'
+  printf 'Press Ctrl-D on a new line when finished.\n> '
+  while IFS= read -r -s line || [[ -n "$line" ]]; do
+    bytes=$((bytes + ${#line} + 1))
+    ((bytes <= 65536)) || die "Setup block is unexpectedly large (>64 KiB)."
+    block+="$line"$'\n'
+  done
   printf '\n'
-  parse_configure_command "$line" || die "Could not parse the Configure command."
-  line=""
+  parse_setup_block "$block" || { block=""; die "Could not parse a valid GitHub Configure line from the pasted block."; }
+  block=""
+  if [[ -n "$expected_repo" ]] && ! repo_equal "$expected_repo" "$PARSED_REPO"; then
+    PARSED_TOKEN=""
+    die "Pasted Configure line targets '$PARSED_REPO', expected '$expected_repo'."
+  fi
 }
 
 cmd_add() {
@@ -181,69 +152,71 @@ cmd_add() {
   require_command curl; require_command tar; require_command sudo; require_command sha256sum; require_command python3
   load_config
 
-  local requested_version=""
+  local expected_repo="" requested_version=""
   while (($#)); do
     case "$1" in
-      --version) requested_version="${2:-}"; shift 2 ;;
+      --version) [[ $# -ge 2 ]] || die "--version requires X.Y.Z"; requested_version="$2"; shift 2 ;;
       -h|--help) usage; return 0 ;;
-      *) die "Unknown add option: $1" ;;
+      --*) die "Unknown add option: $1" ;;
+      *) [[ -z "$expected_repo" ]] || die "Only one repository may be specified."; expected_repo="$(normalize_repo "$1")" || die "Invalid repository: $1"; shift ;;
     esac
   done
-  if [[ -n "$requested_version" ]]; then
-    validate_version "$requested_version" || die "Invalid version: $requested_version"
-  fi
+  [[ -z "$requested_version" ]] || validate_version "$requested_version" || die "Invalid version: $requested_version"
 
-  read_configure_command
+  read_setup_block "$expected_repo"
   local repo="$PARSED_REPO" token="$PARSED_TOKEN"
+  local pasted_version="$PARSED_VERSION" pasted_arch="$PARSED_ARCH" pasted_filename="$PARSED_FILENAME" pasted_url="$PARSED_DOWNLOAD_URL" pasted_sha="$PARSED_SHA256"
   PARSED_TOKEN=""
 
-  local key dir runner_name labels release version filename download_url sha256 metadata archive cached_archive tmp configured=0
-  key="$(repo_key "$repo")"
-  dir="${RUNNER_ROOT}/${key}"
-  runner_name="$(make_runner_name "$RUNNER_NAME_PREFIX" "$repo")"
-  labels="$RUNNER_LABELS"
+  if [[ -n "$pasted_arch" && "$pasted_arch" != "$RUNNER_ARCH" ]]; then token=""; die "GitHub setup block is for linux/$pasted_arch, but this host profile is linux/$RUNNER_ARCH."; fi
+  if [[ -n "$requested_version" && -n "$pasted_version" && "$requested_version" != "$pasted_version" ]]; then token=""; die "--version $requested_version conflicts with GitHub setup block version $pasted_version."; fi
 
-  [[ ! -e "$(state_file_for_repo "$repo")" ]] || die "$repo is already managed on this host."
-  [[ ! -e "$dir" ]] || die "Runner directory already exists: $dir"
-
-  log "Resolving public actions/runner release metadata for linux/${RUNNER_ARCH}"
-  metadata="$(resolve_runner_asset "$RUNNER_ARCH" "$requested_version")"
-  IFS=$'\t' read -r version filename download_url sha256 <<< "$metadata"
-  [[ -n "$version" && -n "$filename" && -n "$download_url" && -n "$sha256" ]] || die "Incomplete runner release metadata."
-
-  if [[ -z "$requested_version" ]]; then
-    log "Public latest runner release is v${version}."
-    warn "GitHub rolls runner versions out progressively. If this repository's Download section shows a different version, cancel now and rerun: runner-manager add --version X.Y.Z"
+  local selected_version="${pasted_version:-$requested_version}"
+  if [[ -n "$pasted_version" ]]; then
+    log "GitHub setup block selects runner v${pasted_version}; using it automatically."
+  elif [[ -n "$requested_version" ]]; then
+    log "Using explicitly selected runner v${requested_version}."
   else
-    log "Using explicitly selected runner release v${version}."
+    warn "The pasted block contained no Download metadata; falling back to the public latest runner release."
+    warn "For progressive rollout safety, copying GitHub's Download + Configure block is preferred over Configure-only paste."
   fi
 
-  tmp="$(mktemp -d)"
-  archive="${tmp}/${filename}"
-  cached_archive="${RUNNER_CACHE}/${filename}"
+  local metadata version filename download_url sha256
+  metadata="$(resolve_runner_asset "$RUNNER_ARCH" "$selected_version")"
+  IFS=$'\t' read -r version filename download_url sha256 <<< "$metadata"
+  [[ -n "$version" && -n "$filename" && -n "$download_url" && -n "$sha256" ]] || { token=""; die "Incomplete official runner release metadata."; }
+
+  # Cross-check all GitHub UI metadata that was present. We still source the actual URL/digest from official public release metadata.
+  [[ -z "$pasted_filename" || "$pasted_filename" == "$filename" ]] || { token=""; die "Pasted runner filename does not match official release metadata."; }
+  [[ -z "$pasted_url" || "$pasted_url" == "$download_url" ]] || { token=""; die "Pasted runner download URL does not match official release metadata."; }
+  [[ -z "$pasted_sha" || "${pasted_sha,,}" == "${sha256,,}" ]] || { token=""; die "Pasted SHA-256 does not match official release metadata."; }
+
+  local key dir runner_name labels tmp archive cached_archive configured=0
+  key="$(repo_key "$repo")"; dir="${RUNNER_ROOT}/${key}"
+  runner_name="$(make_runner_name "$RUNNER_NAME_PREFIX" "$repo")"; labels="$RUNNER_LABELS"
+  [[ ! -e "$(state_file_for_repo "$repo")" ]] || { token=""; die "$repo is already managed on this host."; }
+  [[ ! -e "$dir" ]] || { token=""; die "Runner directory already exists: $dir"; }
+
+  tmp="$(mktemp -d)"; archive="${tmp}/${filename}"; cached_archive="${RUNNER_CACHE}/${filename}"
   cleanup_before_registration() {
     local rc=$?
     trap - EXIT
-    token=""
-    PARSED_TOKEN=""
-    if ((rc != 0)) && ((configured == 0)); then
-      sudo rm -rf "$dir" >/dev/null 2>&1 || true
-    fi
+    token=""; PARSED_TOKEN=""
+    if ((rc != 0)) && ((configured == 0)); then sudo rm -rf "$dir" >/dev/null 2>&1 || true; fi
     rm -rf "$tmp" >/dev/null 2>&1 || true
     exit "$rc"
   }
   trap cleanup_before_registration EXIT
 
   if [[ -s "$cached_archive" ]]; then
-    log "Verifying cached runner package: $filename"
-    printf '%s  %s\n' "$sha256" "$cached_archive" | sha256sum -c - >/dev/null || {
-      warn "Cached package failed checksum; downloading a clean copy."
+    log "Verifying cached official runner package: $filename"
+    if ! printf '%s  %s\n' "$sha256" "$cached_archive" | sha256sum -c - >/dev/null; then
+      warn "Cached package failed checksum; deleting it."
       sudo rm -f "$cached_archive"
-    }
+    fi
   fi
-
   if [[ ! -s "$cached_archive" ]]; then
-    log "Downloading official GitHub runner package v${version}"
+    log "Downloading official GitHub Actions runner v${version}"
     curl --fail --location --proto '=https' --tlsv1.2 --output "$archive" "$download_url"
     printf '%s  %s\n' "$sha256" "$archive" | sha256sum -c -
     sudo install -o root -g root -m 0644 "$archive" "$cached_archive"
@@ -254,49 +227,29 @@ cmd_add() {
   sudo chown -R "$RUNNER_USER:$RUNNER_USER" "$dir"
 
   log "Registering '$runner_name' for $repo as $RUNNER_USER"
-  if ! run_as_runner "$RUNNER_USER" "$dir" \
-      ./config.sh \
-        --url "https://github.com/${repo}" \
-        --token "$token" \
-        --name "$runner_name" \
-        --labels "$labels" \
-        --work _work \
-        --unattended; then
-    token=""
-    die "GitHub runner configuration failed. No persistent manager secret was written."
+  if ! run_as_runner "$RUNNER_USER" "$dir" ./config.sh --url "https://github.com/${repo}" --token "$token" --name "$runner_name" --labels "$labels" --work _work --unattended; then
+    token=""; die "GitHub runner configuration failed. No persistent manager secret was written."
   fi
-  token=""
-  configured=1
+  token=""; configured=1
   [[ -s "$dir/.runner" ]] || die "config.sh returned successfully but .runner was not created; preserving directory for diagnosis: $dir"
 
-  # From this point onward the runner is registered remotely. Preserve local state on later failure;
-  # silently deleting the local installation would strand an unmanaged remote runner.
   write_state "$repo" "$runner_name" "$dir" "$labels" "$version" "registered"
-  trap - EXIT
-  rm -rf "$tmp"
+  trap - EXIT; rm -rf "$tmp"
 
   log "Installing official systemd integration as $RUNNER_USER"
-  if ! (cd "$dir" && sudo ./svc.sh install "$RUNNER_USER"); then
-    die "Runner is registered but service installation failed. Local state is preserved; inspect: $dir"
-  fi
-  if ! (cd "$dir" && sudo ./svc.sh start); then
-    die "Runner is registered and service installed, but service start failed. Local state is preserved."
-  fi
+  (cd "$dir" && sudo ./svc.sh install "$RUNNER_USER") || die "Runner is registered but service installation failed. Local state is preserved; inspect: $dir"
+  (cd "$dir" && sudo ./svc.sh start) || die "Runner is registered and service installed, but service start failed. Local state is preserved."
 
   local service
   service="$(service_name_from_dir "$dir")"
-  if [[ -z "$service" ]] || ! systemctl is-active --quiet "$service"; then
-    die "Runner registration succeeded, but systemd did not report the runner service active."
-  fi
+  [[ -n "$service" ]] && systemctl is-active --quiet "$service" || die "Runner registration succeeded, but systemd did not report the runner service active."
   write_state "$repo" "$runner_name" "$dir" "$labels" "$version" "managed"
 
   log "Registered successfully: $repo"
-  printf '\nRunner name: %s\nRunner version: %s\nLabels: self-hosted, Linux, %s, %s\n' "$runner_name" "$version" "$RUNNER_ARCH" "$labels"
+  printf '\nRepository: %s\nRunner name: %s\nRunner version: %s\nService: active\nLabels: self-hosted, Linux, %s, %s\n' "$repo" "$runner_name" "$version" "$RUNNER_ARCH" "$labels"
   printf 'GitHub settings: https://github.com/%s/settings/actions/runners\n' "$repo"
   printf '\nSuggested dedicated selector:\n  runs-on: [self-hosted, %s]\n' "$SELECTOR_LABEL"
-  if [[ ",${labels}," == *,personal-ci,* ]]; then
-    printf 'Shared pool selector:\n  runs-on: [self-hosted, personal-ci]\n'
-  fi
+  if [[ ",${labels}," == *,personal-ci,* ]]; then printf 'Shared pool selector:\n  runs-on: [self-hosted, personal-ci]\n'; fi
 }
 
 cmd_list() {
@@ -304,99 +257,55 @@ cmd_list() {
   printf 'PROFILE: %s\nRUNNER ROOT: %s\n\n' "$PROFILE" "$RUNNER_ROOT"
   local found=0 state
   shopt -s nullglob
-  for state in "$SHRM_STATE_DIR"/*.conf; do
-    found=1
-    # shellcheck disable=SC1090
-    source "$state"
-    printf '%-45s %-32s v%-10s %s\n' "$REPO" "$RUNNER_NAME" "${RUNNER_VERSION:-?}" "$RUNNER_DIR"
-  done
+  for state in "$SHRM_STATE_DIR"/*.conf; do found=1; source "$state"; printf '%-45s %-32s v%-10s %s\n' "$REPO" "$RUNNER_NAME" "${RUNNER_VERSION:-?}" "$RUNNER_DIR"; done
   ((found == 1)) || printf '(no managed runners)\n'
 }
 
 status_one() {
   local repo="$1" service local_status
   load_state "$repo" || { printf '%-40s LOCAL=unmanaged\n' "$repo"; return 1; }
-  service="$(service_name_from_dir "$RUNNER_DIR")"
-  local_status="unknown"
-  if [[ -n "$service" ]]; then
-    local_status="$(systemctl is-active "$service" 2>/dev/null || true)"
-  fi
-  printf '%-40s service=%-8s phase=%-10s version=%s runner=%s\n' \
-    "$repo" "$local_status" "${RUNNER_PHASE:-unknown}" "${RUNNER_VERSION:-?}" "$RUNNER_NAME"
+  service="$(service_name_from_dir "$RUNNER_DIR")"; local_status="unknown"
+  [[ -z "$service" ]] || local_status="$(systemctl is-active "$service" 2>/dev/null || true)"
+  printf '%-40s service=%-8s phase=%-10s version=%s runner=%s\n' "$repo" "$local_status" "${RUNNER_PHASE:-unknown}" "${RUNNER_VERSION:-?}" "$RUNNER_NAME"
 }
-
 cmd_status() {
-  require_command systemctl
-  load_config
-  if (($# == 1)); then
-    local repo
-    repo="$(normalize_repo "$1")" || die "Invalid repository: $1"
-    status_one "$repo"
-    return
-  fi
+  require_command systemctl; load_config
+  if (($# == 1)); then local repo; repo="$(normalize_repo "$1")" || die "Invalid repository: $1"; status_one "$repo"; return; fi
   (($# == 0)) || die "Usage: runner-manager status [OWNER/REPO]"
-  local state found=0
-  shopt -s nullglob
-  for state in "$SHRM_STATE_DIR"/*.conf; do
-    found=1
-    # shellcheck disable=SC1090
-    source "$state"
-    status_one "$REPO" || true
-  done
+  local state found=0; shopt -s nullglob
+  for state in "$SHRM_STATE_DIR"/*.conf; do found=1; source "$state"; status_one "$REPO" || true; done
   ((found == 1)) || printf '(no managed runners)\n'
 }
 
 cmd_remove() {
-  require_linux; require_not_root; require_systemd
-  require_command sudo
-  load_config
+  require_linux; require_not_root; require_systemd; require_command sudo; load_config
   local assume=0 repo_arg=""
   while (($#)); do
-    case "$1" in
-      --yes|-y) assume=1; shift ;;
-      *) [[ -z "$repo_arg" ]] || die "Usage: runner-manager remove OWNER/REPO [--yes]"; repo_arg="$1"; shift ;;
-    esac
+    case "$1" in --yes|-y) assume=1; shift ;; *) [[ -z "$repo_arg" ]] || die "Usage: runner-manager remove OWNER/REPO [--yes]"; repo_arg="$1"; shift ;; esac
   done
   [[ -n "$repo_arg" ]] || die "Usage: runner-manager remove OWNER/REPO [--yes]"
-
-  local repo service remove_line remove_token
+  local repo token_line token service
   repo="$(normalize_repo "$repo_arg")" || die "Invalid repository: $repo_arg"
   load_state "$repo" || die "$repo is not managed on this host."
-  if ((assume == 0)) && ! confirm "Remove runner '$RUNNER_NAME' for $repo?"; then
-    log "Cancelled."
-    return 0
-  fi
+  if ((assume == 0)) && ! confirm "Remove runner '$RUNNER_NAME' for $repo?"; then log "Cancelled."; return 0; fi
 
-  printf '\nOpen this runner in GitHub and choose Remove:\n'
-  printf '  https://github.com/%s/settings/actions/runners\n' "$repo"
-  printf 'Paste the `./config.sh remove --token ...` command (or only the token). Input is hidden.\n'
-  IFS= read -r -s -p '> ' remove_line
-  printf '\n'
-  parse_remove_command "$remove_line" || die "Could not parse the removal token."
-  remove_token="$PARSED_REMOVE_TOKEN"
-  PARSED_REMOVE_TOKEN=""
-  remove_line=""
+  printf '\nOpen GitHub runner settings and choose this runner -> Remove.\n'
+  printf 'Paste the ./config.sh remove --token ******** command below. Input is hidden.\n'
+  IFS= read -r -s -p '> ' token_line; printf '\n'
+  parse_remove_command "$token_line" || { token_line=""; die "Could not parse a valid removal token."; }
+  token="$PARSED_REMOVE_TOKEN"; PARSED_REMOVE_TOKEN=""; token_line=""
 
   service="$(service_name_from_dir "$RUNNER_DIR")"
   if [[ -x "$RUNNER_DIR/svc.sh" ]]; then
-    log "Stopping service${service:+ $service}"
+    log "Stopping and uninstalling service${service:+ $service}"
     (cd "$RUNNER_DIR" && sudo ./svc.sh stop) || true
-  fi
-
-  if ! run_as_runner "$RUNNER_USER" "$RUNNER_DIR" ./config.sh remove --token "$remove_token"; then
-    remove_token=""
-    warn "GitHub removal failed. Attempting to restart the existing runner service."
-    if [[ -x "$RUNNER_DIR/svc.sh" ]]; then (cd "$RUNNER_DIR" && sudo ./svc.sh start) || true; fi
-    die "Runner was not removed."
-  fi
-  remove_token=""
-
-  if [[ -x "$RUNNER_DIR/svc.sh" ]]; then
-    log "Uninstalling systemd service"
     (cd "$RUNNER_DIR" && sudo ./svc.sh uninstall) || true
   fi
-  sudo rm -rf "$RUNNER_DIR"
-  remove_state "$repo"
+  if [[ -x "$RUNNER_DIR/config.sh" ]]; then
+    if ! run_as_runner "$RUNNER_USER" "$RUNNER_DIR" ./config.sh remove --token "$token"; then token=""; die "GitHub runner removal failed; local runtime/state preserved."; fi
+  fi
+  token=""
+  sudo rm -rf "$RUNNER_DIR"; remove_state "$repo"
   log "Removed: $repo"
 }
 
@@ -407,7 +316,7 @@ case "${1:-help}" in
   status) shift; cmd_status "$@" ;;
   remove) shift; cmd_remove "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
-  version|--version) printf "%s %s\n" "$SHRM_NAME" "$SHRM_VERSION" ;;
+  version|--version) printf '%s %s\n' "$SHRM_NAME" "$SHRM_VERSION" ;;
   help|-h|--help) usage ;;
   *) usage >&2; die "Unknown command: $1" ;;
- esac
+esac

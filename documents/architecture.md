@@ -2,163 +2,74 @@
 
 ## Goal
 
-`self-hosted-runner-manager` manages many repository-scoped GitHub Actions self-hosted runners without storing long-lived GitHub credentials on the runner host.
+Repository-scoped GitHub Actions self-hosted runner を、長期 GitHub credential を runner host に置かずに反復可能な形で管理する。
 
-The operator performs the repository-authenticated step in a normal browser and pastes only GitHub's short-lived Configure command:
-
-```text
-./config.sh --url https://github.com/OWNER/REPO --token ********
-```
-
-Everything else is host-local automation.
-
-## Runtime model
+## Trust split
 
 ```text
-Browser / human GitHub session
+Browser / operator
+  GitHub login exists here
   |
-  | short-lived repository registration token
+  | short-lived GitHub setup text
   v
-Host admin user
-  └─ runner-manager
-      ├─ unauthenticated public API -> actions/runner releases
-      ├─ SHA-256 verify official runner archive
-      └─ sudo only for host setup / service lifecycle
-
-Host
-├─ admin user
-│  └─ runner-manager (no gh auth / no PAT)
-├─ gha-runner user
-│  ├─ /opt/github-actions-runners/owner--repo-a
-│  └─ /opt/github-actions-runners/owner--repo-b
-└─ systemd
-   ├─ actions.runner....repo-a.service
-   └─ actions.runner....repo-b.service
+Runner host
+  no gh auth / PAT / OAuth / GitHub SSH key
 ```
 
-The long-running `gha-runner` user never receives GitHub API credentials from this project.
+GitHub private-repository API を runner host から呼ばない代わりに、New self-hosted runner UI の setup block を operator が一度 pasteする。
 
-## Provisioning flow
+## Add flow (v0.3)
 
-`runner-manager add` performs:
+1. Optional `OWNER/REPO` argument を expected repository として保持する。
+2. GitHub Download + Configure block を hidden multi-line input で受け取る。
+3. Pasted text は shell として実行せず、parser が data として以下だけ抽出する。
+   - Configure repository URL
+   - short-lived registration token
+   - Linux runner version / architecture
+   - official release filename / download URL
+   - SHA-256 (存在する場合)
+4. Expected repository と Configure URL を比較する。
+5. GitHub UI から version を抽出できた場合、それを progressive-rollout source of truth とする。
+6. Public `actions/runner` Release API の exact tag (`vX.Y.Z`) を取得する。
+7. Official release metadata と pasted filename / URL / digest を cross-check する。
+8. Actual download URL / SHA-256 は official public release metadata を使用する。
+9. Versioned cache を検証し、必要なら package をdownloadする。
+10. Dedicated `gha-runner` user で official `config.sh --unattended` を実行する。
+11. Official `svc.sh` で systemd service を install/start する。
+12. Non-secret local state を保存する。
 
-1. Validate Linux, systemd, host configuration, and required local tools.
-2. Prompt (hidden input) for the exact `./config.sh --url ... --token ...` line shown by GitHub.
-3. Parse and validate repository URL and short-lived registration token without evaluating the input as shell code.
-4. Resolve the public `actions/runner` latest release, or a user-selected `--version X.Y.Z` release.
-5. Select the exact `actions-runner-linux-<arch>-<version>.tar.gz` asset.
-6. Require the release asset's machine-readable `sha256:` digest.
-7. Reuse a verified versioned archive from `/var/cache/self-hosted-runner-manager/`, or download and verify it.
-8. Extract into a repository-specific runner directory.
-9. Run official `config.sh` as `gha-runner` with host-specific labels.
-10. Persist only non-secret local state.
-11. Install/start the official runner systemd integration through generated `svc.sh`.
-12. Verify local systemd active state.
+Configure line だけをpasteした場合は public latest へfallbackするが、progressive rollout の差を自動検出できないため警告する。
 
-## Why the manager does not automatically query the private repository setup page
+## Why pasted shell is never executed
 
-GitHub's repository runner setup page is authenticated and repository-specific. The host intentionally has no GitHub login credential, so it cannot safely query that private page or the private repository runner APIs.
+Setup page 由来の text は untrusted input として扱う。manager は `eval`, `source`, pasted `bash -c` を使用しない。
 
-The public `actions/runner` release API is sufficient to obtain:
-
-- release version;
-- Linux asset URL;
-- SHA-256 digest.
-
-However, GitHub uses progressive runner releases. The newest public runner release can temporarily differ from the version shown for a specific repository. For that reason:
-
-```bash
-runner-manager add
-```
-
-uses the latest public stable release, while:
-
-```bash
-runner-manager add --version 2.336.0
-```
-
-lets the operator mirror the version shown by the repository setup page without manually copying download URLs or hashes.
-
-## Failure semantics
-
-Before `config.sh` succeeds, failed provisioning removes partial local runtime state.
-
-After `config.sh` succeeds, the runner exists remotely. If subsequent service installation/start fails, the manager deliberately preserves the local runner directory and local state instead of deleting it and stranding an unmanaged remote registration.
+Extra command が含まれていても parser が必要 field を抽出するだけで実行されない。
 
 ## Host profiles
 
-### `xserver`
+### xserver
 
 - `personal-ci`
 - `xserver`
 - `always-on`
 
-```yaml
-runs-on: [self-hosted, xserver]
-```
-
-### `desktop-wsl`
+### desktop-wsl
 
 - `personal-ci`
 - `desktop-wsl`
 - `high-memory`
 
-```yaml
-runs-on: [self-hosted, desktop-wsl]
-```
-
-Shared pool:
-
-```yaml
-runs-on: [self-hosted, personal-ci]
-```
-
-This is eligibility routing, not priority/fallback routing.
-
-## Status model
-
-Without host GitHub credentials, `runner-manager status` reports local manager state and systemd status only. GitHub's remote online/busy state remains visible in the repository Actions Runner UI.
-
-## Removal flow
-
-Removal also avoids long-lived credentials:
-
-1. Operator opens the registered runner's GitHub removal UI.
-2. GitHub provides a short-lived `./config.sh remove --token ...` command.
-3. Operator pastes it into a hidden manager prompt.
-4. Manager stops the service, invokes official `config.sh remove`, uninstalls systemd integration, then removes local state.
-5. If upstream removal fails, manager attempts to restart the existing service instead of blindly deleting local state.
-
-## Concurrency
-
-Repository-scoped runners are independent processes. Five registered repositories can accept five jobs simultaneously.
-
-This is important for the 4-core / 6-GB VPS target. v0.2 does not claim to enforce a host-wide concurrency limit. A robust cross-runner semaphore remains a separate design task.
-
-## State
-
-Host config:
-
-```text
-/etc/self-hosted-runner-manager/config
-```
-
-Non-secret per-repository state:
-
-```text
-/etc/self-hosted-runner-manager/runners/<owner>--<repo>.conf
-```
-
-Runtime:
+## Runtime
 
 ```text
 /opt/github-actions-runners/<owner>--<repo>/
 ```
 
-Cache:
+One repository runner = one runner process = one systemd service.
 
-```text
-/var/cache/self-hosted-runner-manager/
-```
+## Concurrency
 
-Registration/removal tokens are never written to manager state.
+Cross-repository host-wide concurrency is not enforced in v0.3. Multiple repository-scoped runner processes can accept jobs concurrently.
+
+A future design should use a robust host-wide admission mechanism that handles abnormal exits and stale locks before being enabled by default.

