@@ -1,92 +1,89 @@
 # self-hosted-runner-manager
 
-Repository-scoped GitHub Actions self-hosted runnerを、多数のprivate repositoryへ追加する作業を簡略化するLinux向け管理ツールです。
+Repository-scoped GitHub Actions self-hosted runner を、多数の private repository へ安全かつ少ない手入力で追加する Linux 向け管理ツールです。
 
-**v0.2から、RunnerホストにGitHub CLI (`gh`)・PAT・OAuth tokenを置きません。**
+**Runner ホストには `gh` / PAT / OAuth token / GitHub SSH key を置きません。**
 
-GitHubのブラウザ画面で表示される短時間有効なConfigureコマンドだけを、その場で安全に貼り付けます。
+GitHub のブラウザ画面に表示される短時間有効な setup block を一度 paste すると、manager が必要な情報だけを解析して runner を構築します。貼り付けられた shell command 自体は **一切 `eval` / `bash -c` しません**。
+
+## Target UX
+
+```bash
+runner-manager add Daiki-Yoshida/TestGitHubActions
+```
+
+manager が対象 repository の New self-hosted runner URL を表示します。
+
+GitHub の `Download` + `Configure` をまとめてコピーして terminal に一度 pasteし、最後に `Ctrl-D`:
 
 ```text
+mkdir actions-runner && cd actions-runner
+curl -o actions-runner-linux-x64-2.337.0.tar.gz -L https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-x64-2.337.0.tar.gz
+echo "<sha256>  actions-runner-linux-x64-2.337.0.tar.gz" | shasum -a 256 -c
+tar xzf ./actions-runner-linux-x64-2.337.0.tar.gz
 ./config.sh --url https://github.com/Daiki-Yoshida/TestGitHubActions --token ********
 ```
 
-それ以外のDownload / checksum validation / extract / labels / systemd service化はmanagerが自動化します。
+これだけで manager が:
 
-## 想定ホスト
+1. Configure URL から repository を検証
+2. GitHub setup block から rollout 対象 runner version / architecture を自動認識
+3. public `actions/runner` Release API から同じ version の official asset を取得
+4. pasted download URL / filename / SHA-256 が official metadata と一致する場合だけ続行
+5. package download + SHA-256 検証 + cache
+6. dedicated `gha-runner` user で `config.sh` 実行
+7. host profile labels を付与
+8. GitHub 公式 `svc.sh` で systemd service 化
+9. local state を保存
 
-- 常時稼働のUbuntu VPS
-- Windows上のWSL Ubuntu
+します。
 
-Organization runnerを前提にせず、個人アカウント配下に多数あるprivate repositoryへrepository-level runnerを追加する運用を対象にしています。
+## Why paste the whole setup block?
 
-## Security goal
+GitHub Actions Runner は progressive rollout です。public latest と、特定 repository の `New self-hosted runner` 画面に表示される version が一時的に異なることがあります。
 
-Runnerホストに長期GitHub credentialを保存しないことを最優先します。
+v0.3 では **GitHub UI に表示された Download block の version を自動で採用**するため、通常は `--version` を手入力する必要がありません。
+
+Download block がない Configure line だけでも登録できます。その場合は public latest に fallback し、警告を表示します。
+
+緊急時や検証用には明示指定も残しています。
+
+```bash
+runner-manager add Daiki-Yoshida/TestGitHubActions --version 2.337.0
+```
+
+## Security model
 
 ```text
 Browser (GitHub authenticated)
   |
-  |  one-hour Configure token (manual paste)
+  | short-lived setup text
   v
 runner-manager on VPS / WSL
   |
-  +--> public actions/runner release API (no auth)
-  +--> official runner package + SHA-256 digest
-  +--> config.sh
-  +--> systemd
+  +-- parse only; never execute pasted shell
+  +-- public actions/runner Release API (no auth)
+  +-- official package + SHA-256 digest
+  +-- config.sh as gha-runner
+  +-- systemd
 
-No gh auth / PAT / GitHub OAuth credential on the runner host.
+No long-lived GitHub credential on runner host.
 ```
 
-登録tokenは入力時にechoせず、managerのstateにも保存しません。upstream `config.sh` の引数として渡す瞬間だけprocess argumentsから観測可能です。
+Registration/remove token は:
 
-## Important: runner version and GitHub progressive rollout
+- hidden input で受け取る
+- manager state へ保存しない
+- stdout/stderr へ表示しない
+- `config.sh` に渡した後に shell variable から破棄する
 
-GitHub Actions Runnerはprogressive releaseです。そのため、public `actions/runner` の最新releaseと、特定repositoryの `Settings -> Actions -> Runners -> New self-hosted runner` が案内するversionが一時的に異なる場合があります。
-
-通常はpublic latestを自動選択します。
-
-```bash
-runner-manager add
-```
-
-GitHubのDownload欄が別versionを表示している場合だけ、そのversionを明示してください。
-
-```bash
-runner-manager add --version 2.336.0
-```
-
-version番号だけ指定すれば、download URLとSHA-256 digestはpublicなofficial `actions/runner` release metadataからmanagerが取得します。
-
-## Runner package integrity
-
-managerはpublic GitHub REST APIから `actions/runner` release assetを取得し、asset metadataの `digest` (`sha256:...`) を使ってdownloadしたarchiveを検証します。
-
-つまりGitHub画面の以下は手入力不要です。
-
-```text
-curl -o actions-runner-linux-x64-....tar.gz ...
-echo "<sha256> ..." | shasum -a 256 -c
-tar xzf ...
-```
+upstream `config.sh` の仕様上、実行中だけ同一ホスト上の高権限 process から argv を観測できる可能性はあります。
 
 ## Install
 
-このrepositoryを**public repositoryとして運用することを推奨**します。そうすればRunnerホストはGitHub認証なしで取得できます。
+credential-free bootstrap を使うには、この repository を public で運用してください。
 
-### Cloneして確認してからinstall（推奨）
-
-```bash
-git clone https://github.com/Daiki-Yoshida/self-hosted-runner-manager.git
-cd self-hosted-runner-manager
-./install.sh
-```
-
-### Public bootstrap script
-
-repositoryをpublic化した後は、GitHub credentialなしでbootstrapできます。
-
-セキュリティ上、いきなり`curl | sudo sh`にはせず、いったん保存して内容を確認する運用を推奨します。
+まず内容を保存・確認してから実行する運用を推奨します。
 
 ```bash
 curl -fsSL \
@@ -97,33 +94,40 @@ less /tmp/self-hosted-runner-manager-bootstrap.sh
 bash /tmp/self-hosted-runner-manager-bootstrap.sh
 ```
 
-`bootstrap.sh` 自体はpublic GitHubからsource archiveを取得して通常の`install.sh`を実行するだけで、GitHub認証は行いません。将来tag運用にした場合は `SHRM_REF` で取得refを固定できます。
+`bootstrap.sh` は public GitHub Release が存在すれば **latest stable tag** を優先します。Release がまだない場合だけ `main` に fallback して警告します。
+
+固定 version:
 
 ```bash
-SHRM_REF=v0.2.0 bash /tmp/self-hosted-runner-manager-bootstrap.sh
+SHRM_VERSION=0.3.0 bash /tmp/self-hosted-runner-manager-bootstrap.sh
 ```
 
-インストール先:
+任意 tag / commit pin:
 
-```text
-/usr/local/bin/runner-manager
-/usr/local/lib/self-hosted-runner-manager/
+```bash
+SHRM_REF=<tag-or-commit> bash /tmp/self-hosted-runner-manager-bootstrap.sh
 ```
 
-必要コマンド:
+Clone install も可能です。
+
+```bash
+git clone https://github.com/Daiki-Yoshida/self-hosted-runner-manager.git
+cd self-hosted-runner-manager
+./install.sh
+```
+
+Required commands:
 
 - `curl`
 - `tar`
 - `sha256sum`
-- `python3` (public GitHub release JSONの安全なparse用)
+- `python3`
 - `sudo`
 - `systemd`
 
 `gh` は不要です。
 
-## 1. Host initialization
-
-ホストごとに一度だけ実行します。
+## Initialize host
 
 ### XServer VPS
 
@@ -132,7 +136,7 @@ runner-manager init --profile xserver
 runner-manager doctor
 ```
 
-Default custom labels:
+Labels:
 
 ```text
 personal-ci
@@ -147,7 +151,7 @@ runner-manager init --profile desktop-wsl
 runner-manager doctor
 ```
 
-Default custom labels:
+Labels:
 
 ```text
 personal-ci
@@ -155,90 +159,47 @@ desktop-wsl
 high-memory
 ```
 
-`init` は専用Unix user `gha-runner`、runner root/cache/state、Ubuntu `needrestart` overrideを準備します。`gha-runner` にsudoやDocker groupは与えません。
+`init` は dedicated Unix user `gha-runner`、runtime/cache/state directories、Ubuntu `needrestart` override を準備します。`gha-runner` に sudo / Docker group は与えません。
 
-## 2. Add a repository runner
+## Add runner
 
-GitHubブラウザで対象repositoryを開きます。
+Repository を先に指定する推奨形:
 
-```text
-Settings
--> Actions
--> Runners
--> New self-hosted runner
--> Linux / x64
+```bash
+runner-manager add Daiki-Yoshida/TestGitHubActions
 ```
 
-その後VPS/WSLで:
+この場合、pasted Configure line が別 repository を指していれば **登録前に拒否**します。
+
+Repository 名を省略して setup block の Configure URL から自動判定することもできます。
 
 ```bash
 runner-manager add
 ```
 
-managerが次のようにpromptします。
+## Workflow selectors
 
-```text
-Paste ONLY the Configure line shown by GitHub. Input is hidden so the token is not echoed.
-Example: ./config.sh --url https://github.com/OWNER/REPO --token ********
->
-```
-
-ここへGitHubのConfigure欄の1行だけpasteします。
-
-```text
-./config.sh --url https://github.com/Daiki-Yoshida/TestGitHubActions --token ********
-```
-
-managerはURLからrepositoryを認識します。tokenは保存しません。
-
-その後自動で:
-
-1. host architectureを選択
-2. official `actions/runner` release metadata取得
-3. Linux runner archive取得
-4. SHA-256 digest検証
-5. versioned cacheへ保存
-6. repository専用runtime directoryへ展開
-7. `gha-runner` としてofficial `config.sh` 実行
-8. host profile labels設定
-9. GitHub公式 `svc.sh` でsystemd service化
-10. service active確認
-
-を実行します。
-
-### GitHub画面とversionが違う場合
-
-例としてGitHub画面が `2.336.0` を案内しているなら:
-
-```bash
-runner-manager add --version 2.336.0
-```
-
-Configureコマンドのpaste方法は同じです。
-
-## 3. Workflow selector
-
-VPSのみ:
+VPS only:
 
 ```yaml
 runs-on: [self-hosted, xserver]
 ```
 
-Desktop WSLのみ:
+Desktop WSL only:
 
 ```yaml
 runs-on: [self-hosted, desktop-wsl]
 ```
 
-どちらでもよい場合:
+Either host:
 
 ```yaml
 runs-on: [self-hosted, personal-ci]
 ```
 
-`personal-ci` はpriority/fallbackではありません。複数matching runnerがonline + idleならGitHubがeligible runnerを選択します。
+`personal-ci` は priority/fallback ではありません。
 
-## 4. Status
+## Status
 
 ```bash
 runner-manager list
@@ -246,65 +207,47 @@ runner-manager status
 runner-manager status Daiki-Yoshida/TestGitHubActions
 ```
 
-v0.2ではGitHub credentialをホストに持たないため、`status` はlocal systemd/stateを確認します。remote GitHub statusはブラウザのActions Runner画面で確認します。
+Runner host に private-repo credential を置かないため、status は local systemd/state を表示します。GitHub remote status はブラウザで確認します。
 
-## 5. Remove
+## Remove
 
 ```bash
 runner-manager remove Daiki-Yoshida/TestGitHubActions
 ```
 
-managerがGitHubのRunner removal画面を案内します。そこで表示される:
+GitHub の runner removal 画面に表示される:
 
 ```text
 ./config.sh remove --token ********
 ```
 
-をhidden promptへpasteします。remove tokenも保存しません。
+だけを hidden prompt へ pasteします。remove token も保存しません。
 
-## State and runtime
-
-Host configuration:
+## State
 
 ```text
 /etc/self-hosted-runner-manager/config
-```
-
-Per-repository non-secret state:
-
-```text
 /etc/self-hosted-runner-manager/runners/<owner>--<repo>.conf
-```
-
-Runner runtime:
-
-```text
 /opt/github-actions-runners/<owner>--<repo>/
-```
-
-Versioned package cache:
-
-```text
 /var/cache/self-hosted-runner-manager/
 ```
 
-## Multiple repositories on one host
+state は non-secret のみです。
 
-Repository-level runnersは独立processです。10 repositoryを1台に登録すると、理論上10 jobを同時にacceptできます。
+## Concurrency limitation
 
-4-core / 6-GB VPSでは危険なため、host-wide concurrency limitは別途設計対象です。v0.2はまだ「全repository合計1 job」を保証しません。
+Repository-level runner は repository ごとに独立 process です。1台に10 repositoryを登録すれば、理論上10 jobを同時acceptできます。
 
-## Security boundary
+**v0.3 は host-wide concurrency limit をまだ実装していません。** 4-core / 6-GB VPS では特に軽量 workflow に限定するか、別途 concurrency 制御を設計してください。
 
-このmanagerは以下を変更しません。
+## Development
 
-- SSH
-- UFW
-- XServer packet filter
-- Tailscale
-- Docker permission
-- repository workflow
+```bash
+bash -n bin/runner-manager lib/common.sh bootstrap.sh install.sh uninstall.sh tests/run.sh
+tests/run.sh
+```
 
-Self-hosted runnerで実行可能なrepositoryは、そのホストのrunner権限を信頼できるprivate repositoryに限定してください。
+詳細:
 
-詳細は [`documents/security.md`](documents/security.md) と [`documents/architecture.md`](documents/architecture.md) を参照してください。
+- [Architecture](documents/architecture.md)
+- [Security model](documents/security.md)
